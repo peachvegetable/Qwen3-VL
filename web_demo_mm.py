@@ -27,7 +27,7 @@ def _get_args():
     parser.add_argument('-c',
                         '--checkpoint-path',
                         type=str,
-                        default='Qwen/Qwen3-VL-235B-A22B-Instruct',
+                        default='Qwen/Qwen3-VL-4B-Instruct',
                         help='Checkpoint name or path, default to %(default)r')
     parser.add_argument('--cpu-only', action='store_true', help='Run demo with CPU only')
 
@@ -58,6 +58,15 @@ def _get_args():
                         type=int,
                         default=None,
                         help='Tensor parallel size for vLLM (default: auto)')
+    parser.add_argument('--max-model-len',
+                        type=int,
+                        default=8192,
+                        help='Maximum sequence length for the engine (reduces KV cache).')
+    parser.add_argument('--kv-cache-dtype',
+                        type=str,
+                        choices=['auto', 'fp8', 'fp16', 'bf16'],
+                        default='auto',
+                        help='KV cache dtype for vLLM.')
 
     args = parser.parse_args()
     return args
@@ -80,7 +89,9 @@ def _load_model_processor(args):
             gpu_memory_utilization=args.gpu_memory_utilization,
             enforce_eager=False,
             tensor_parallel_size=tensor_parallel_size,
-            seed=0
+            seed=0,
+            max_model_len=args.max_model_len, # NEW
+            kv_cache_dtype=args.kv_cache_dtype # NEW
         )
 
         # Load processor for vLLM
