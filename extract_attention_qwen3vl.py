@@ -41,6 +41,8 @@ import math
 from typing import Dict, List, Tuple, Optional
 from typing import Union
 
+from PIL import Image
+
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 try:
@@ -55,6 +57,9 @@ try:
     HAS_SEABORN = True
 except ImportError:
     HAS_SEABORN = False
+
+
+DEFAULT_IMAGE_PATCH_SIZE = 16
 
 
 DTYPE_MAP = {
@@ -547,6 +552,37 @@ class AttentionVisualizer:
 
         return save_path
 
+    def overlay_attention_on_frame(
+        self,
+        frame_path: Path,
+        attention_hw: np.ndarray,
+        frame_idx: int,
+        save_path: Optional[Path] = None,
+        alpha: float = 0.45,
+    ):
+        """Overlay a spatial attention heatmap on top of the actual frame."""
+        frame = Image.open(frame_path).convert("RGB")
+        heat = attention_hw.astype(np.float32)
+        heat -= heat.min()
+        maxv = heat.max()
+        if maxv > 0:
+            heat /= maxv
+        heat_img = Image.fromarray(np.uint8(heat * 255)).resize(frame.size, resample=Image.BILINEAR)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.imshow(frame)
+        ax.imshow(np.array(heat_img) / 255.0, cmap='jet', alpha=alpha, vmin=0.0, vmax=1.0)
+        ax.set_title(f"Frame {frame_idx}: Attention Overlay")
+        ax.axis('off')
+
+        if save_path is None:
+            save_path = self.output_dir / f"frame_{frame_idx:03d}_overlay.png"
+
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+        return save_path
+
 
 def extract_attention_qwen3vl(
     model_path: str,
@@ -568,6 +604,7 @@ def extract_attention_qwen3vl(
     top_k: int = 5,
     normalize_rows: bool = True,
     fps: float = 1.0,
+    max_input_frames: Optional[int] = 32,
 ) -> Dict:
     """Extract attention maps from a native Qwen3-VL checkpoint."""
 
@@ -601,11 +638,19 @@ def extract_attention_qwen3vl(
     print(f"[3/5] Processing video: {video_path}")
     print(f"Question: {question}")
 
+    video_payload = {
+        "type": "video",
+        "video": video_path,
+        "fps": fps
+    }
+    if max_input_frames is not None:
+        video_payload["max_frames"] = max_input_frames
+
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "video", "video": video_path, "fps": fps, "max_pixels": 40000},
+                video_payload,
                 {"type": "text", "text": question},
             ],
         }
@@ -614,7 +659,28 @@ def extract_attention_qwen3vl(
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     if HAS_QWEN_VL_UTILS:
-        image_inputs, video_inputs = process_vision_info(messages)
+        video_kwargs = {}
+        video_metadatas = None
+        process_kwargs = dict(
+            image_patch_size=DEFAULT_IMAGE_PATCH_SIZE,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
+        try:
+            image_inputs, video_inputs, video_kwargs = process_vision_info(messages, **process_kwargs)
+        except TypeError as exc:
+            print(
+                "Warning: process_vision_info does not support metadata kwargs; "
+                "falling back to legacy behavior. (" + str(exc) + ")"
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            video_kwargs = {}
+        if video_inputs is not None and len(video_inputs) > 0:
+            first = video_inputs[0]
+            if isinstance(first, (list, tuple)) and len(first) == 2 and isinstance(first[1], dict):
+                vids, metas = zip(*video_inputs)
+                video_inputs = list(vids)
+                video_metadatas = list(metas)
     else:
         raise ImportError("qwen_vl_utils is required")
 
@@ -651,11 +717,11 @@ def extract_attention_qwen3vl(
     sampled_dir = output_dir / "sampled_frames"
     sampled_dir.mkdir(parents=True, exist_ok=True)
     sampled_count = 0
+    frame_image_paths: List[Path] = []
     try:
         if isinstance(video_inputs, (list, tuple)) and len(video_inputs) > 0:
             vid = video_inputs[0]
             if isinstance(vid, (list, tuple)):
-                from PIL import Image
                 for i, f in enumerate(vid):
                     out_path = sampled_dir / f"frame_{i:05d}.jpg"
                     if hasattr(f, 'save'):
@@ -681,8 +747,8 @@ def extract_attention_qwen3vl(
                         arr = _frame_to_hwc_uint8(f)
                         Image.fromarray(arr).save(out_path)
                     sampled_count += 1
+                    frame_image_paths.append(out_path)
             elif isinstance(vid, (torch.Tensor, np.ndarray)):
-                from PIL import Image
                 tdim = vid.shape[0]
                 for i in range(tdim):
                     out_path = sampled_dir / f"frame_{i:05d}.jpg"
@@ -698,6 +764,7 @@ def extract_attention_qwen3vl(
                             pass
                     arr = _frame_to_hwc_uint8(fr)
                     Image.fromarray(arr).save(out_path)
+                    frame_image_paths.append(out_path)
                 sampled_count = tdim
         # Save metadata about sampling
         (output_dir / "sampled_frames_metadata.json").write_text(
@@ -710,13 +777,27 @@ def extract_attention_qwen3vl(
     except Exception as e:
         print(f"Warning: failed to export sampled frames: {type(e).__name__}: {e}")
 
-    inputs = processor(
+    if sampled_count:
+        limit_msg = ""
+        if max_input_frames is not None and sampled_count >= max_input_frames:
+            limit_msg = " (hit max_input_frames limit; adjust --max_input_frames or --fps if needed)"
+        print(f"Sampled {sampled_count} frames via qwen-vl-utils{limit_msg}")
+
+    processor_kwargs = dict(
         text=[text],
         images=image_inputs,
         videos=video_inputs,
         padding=True,
-        return_tensors="pt"
+        return_tensors="pt",
+        do_resize=False,
     )
+    if HAS_QWEN_VL_UTILS:
+        if video_metadatas is not None:
+            processor_kwargs["video_metadata"] = video_metadatas
+        if video_kwargs:
+            processor_kwargs.update(video_kwargs)
+
+    inputs = processor(**processor_kwargs)
     inputs = inputs.to(target_device)
 
     print(f"Input shape: {inputs.input_ids.shape}")
@@ -1100,6 +1181,15 @@ def extract_attention_qwen3vl(
     print(f"\nCreating visualizations")
 
     visualizer = AttentionVisualizer(output_dir)
+    overlay_dir = None
+    if frame_image_paths and len(frame_image_paths) >= mapper.num_frames:
+        overlay_dir = output_dir / "frames_with_attention"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+    elif frame_image_paths and len(frame_image_paths) > 0:
+        print(
+            f"Warning: have {len(frame_image_paths)} sampled frames but {mapper.num_frames} attention frames;"
+            " skipping overlays"
+        )
 
     for frame_idx in range(mapper.num_frames):
         # TEXT→VISION
@@ -1120,6 +1210,15 @@ def extract_attention_qwen3vl(
             save_path=output_dir / f"frame_{frame_idx:03d}_vision_to_text.png"
         )
 
+        if overlay_dir is not None:
+            spatial_attn = frame_attentions_tv[frame_idx].mean(axis=0).reshape(pre_h, pre_w)
+            visualizer.overlay_attention_on_frame(
+                frame_path=frame_image_paths[frame_idx],
+                attention_hw=spatial_attn,
+                frame_idx=frame_idx,
+                save_path=overlay_dir / f"frame_{frame_idx:03d}_overlay.png",
+            )
+
     print(f"Saved {mapper.num_frames} x 2 visualization types")
 
     # Summary visualizations
@@ -1133,6 +1232,8 @@ def extract_attention_qwen3vl(
         "attn_implementation": attn_implementation,
         "video_path": video_path,
         "question": question,
+        "requested_fps": fps,
+        "max_input_frames": max_input_frames,
         "num_frames": mapper.num_frames,
         "spatial_grid": mapper.spatial_grid,
         "pre_merger_grid": mapper.pre_merger_grid,
@@ -1142,6 +1243,9 @@ def extract_attention_qwen3vl(
         "generated_text": generated_text[0],
         "vision_to_text_enabled": vision_to_text,
     }
+
+    if overlay_dir is not None:
+        metadata["attention_overlay_dir"] = str(overlay_dir)
 
     if vision_to_text and len(frame_attentions_vt_per_head) > 0:
         metadata["vision_to_text_num_heads"] = len(frame_attentions_vt_per_head[0])
@@ -1187,6 +1291,12 @@ def main():
     parser.add_argument("--question", type=str, required=True, help="Question about the video")
     parser.add_argument("--output_dir", type=str, default="outputs/attn", help="Output directory")
     parser.add_argument("--fps", type=float, default=1.0, help="Sampling FPS for preprocessing the video")
+    parser.add_argument(
+        "--max_input_frames",
+        type=int,
+        default=32,
+        help="Upper bound on frames sampled by qwen-vl-utils before feeding the processor (set to 0 or negative to disable)",
+    )
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-VL-4B-Instruct", help="Model path or local checkpoint")
     parser.add_argument(
         "--dtype",
@@ -1239,7 +1349,8 @@ def main():
         max_vis_heads=args.max_vis_heads,
         save_top_k_analysis=args.save_top_k_analysis,
         top_k=args.top_k,
-        normalize_rows=not args.no_normalize_rows
+        normalize_rows=not args.no_normalize_rows,
+        max_input_frames=(args.max_input_frames if args.max_input_frames and args.max_input_frames > 0 else None),
     )
 
 
