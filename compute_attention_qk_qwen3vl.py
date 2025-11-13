@@ -112,6 +112,16 @@ def build_content_mask(
     return base_mask
 
 
+def _find_subsequence(sequence: List[int], pattern: List[int]) -> Optional[int]:
+    if not pattern or len(pattern) > len(sequence):
+        return None
+    plen = len(pattern)
+    for start in range(len(sequence) - plen + 1):
+        if sequence[start : start + plen] == pattern:
+            return start
+    return None
+
+
 def prepare_inputs(
     processor,
     video_path: str,
@@ -477,6 +487,14 @@ def main():
         raise RuntimeError("Question token selection is empty after filtering.")
     text_tokens = [processor.tokenizer.decode([int(inputs.input_ids[0, idx])]).strip() for idx in text_idx]
     text_token_ids = [int(inputs.input_ids[0, idx]) for idx in text_idx]
+    question_ids = processor.tokenizer(args.question, add_special_tokens=False).input_ids
+    if question_ids:
+        span_start = _find_subsequence(text_token_ids, question_ids)
+        if span_start is not None:
+            span_end = span_start + len(question_ids)
+            text_idx = text_idx[span_start:span_end]
+            text_tokens = text_tokens[span_start:span_end]
+            text_token_ids = text_token_ids[span_start:span_end]
     content_mask_flags = build_content_mask(
         processor.tokenizer,
         text_token_ids,
