@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 import matplotlib.pyplot as plt
+from PIL import Image
 
 try:
     import seaborn as sns
@@ -129,7 +130,7 @@ def prepare_inputs(
     device: torch.device,
     fps: float,
     max_frames: Optional[int],
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, Optional[List]]]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Optional[List]], Optional[List]]:
     if not HAS_QWEN_VL_UTILS:
         raise ImportError("qwen_vl_utils is required for video preprocessing")
 
@@ -197,7 +198,73 @@ def prepare_inputs(
         "video_kwargs": video_kwargs,
         "text_prompt": text_prompt,
     }
-    return inputs, media_meta
+    return inputs, media_meta, video_inputs
+
+
+def _tensor_frame_to_numpy(frame: torch.Tensor) -> np.ndarray:
+    """Convert a single video frame tensor (C,H,W) or (H,W,C) to uint8 numpy RGB."""
+
+    tensor = frame.detach().cpu()
+    if tensor.dim() == 3 and tensor.shape[0] in (1, 3):
+        tensor = tensor.permute(1, 2, 0)
+    tensor = tensor.contiguous().float()
+    max_val = float(tensor.max().item()) if tensor.numel() else 0.0
+    if max_val <= 1.5:
+        tensor = tensor * 255.0
+    tensor = tensor.clamp(0, 255).to(torch.uint8)
+    return tensor.contiguous().numpy()
+
+
+def extract_frame_images(video_frames_store: Optional[List], max_frames: int) -> Optional[List[np.ndarray]]:
+    """Flatten assorted video frame containers into a list of RGB numpy arrays."""
+
+    if not video_frames_store or max_frames <= 0:
+        return None
+
+    collected: List[np.ndarray] = []
+
+    def _append_frame(arr: np.ndarray) -> bool:
+        collected.append(arr)
+        return len(collected) >= max_frames
+
+    def _handle_item(item) -> bool:
+        if item is None:
+            return False
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().cpu()
+            if tensor.dim() == 4:
+                for frame_tensor in tensor:
+                    if _append_frame(_tensor_frame_to_numpy(frame_tensor)):
+                        return True
+            elif tensor.dim() == 3:
+                if _append_frame(_tensor_frame_to_numpy(tensor)):
+                    return True
+            return False
+        if isinstance(item, Image.Image):
+            if _append_frame(np.array(item.convert("RGB"))):
+                return True
+            return False
+        if isinstance(item, np.ndarray):
+            array = item
+            if array.ndim == 3 and array.shape[2] == 4:
+                array = array[:, :, :3]
+            if array.dtype != np.uint8:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+            if _append_frame(array):
+                return True
+            return False
+        if isinstance(item, (list, tuple)):
+            for element in item:
+                if _handle_item(element):
+                    return True
+        return False
+
+    sources = video_frames_store if isinstance(video_frames_store, (list, tuple)) else [video_frames_store]
+    for src in sources:
+        if _handle_item(src):
+            break
+
+    return collected if collected else None
 
 
 # ---------------------------------------------------------------------------
@@ -294,21 +361,7 @@ def save_heatmap(matrix: np.ndarray, save_path: Path, title: str):
 # Streaming attention reconstruction
 # ---------------------------------------------------------------------------
 
-def stream_qk_attention(
-    attn_module,
-    capture: PrefillStateCapture,
-    vision_indices: torch.Tensor,
-    text_indices: torch.Tensor,
-    mapper: TokenIndexMapper,
-    content_idx_tensor: torch.Tensor,
-    chunk_q: int,
-    pool: str,
-    pool_topk: int,
-    score_topk: int,
-    save_viz_mats: bool,
-    no_head_avg: bool,
-    output_dir: Path,
-):
+def reconstruct_qk_states(attn_module, capture: PrefillStateCapture) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     if capture.hidden_states is None or capture.position_embeddings is None:
         raise RuntimeError("Prefill hidden states/positional embeddings were not captured.")
 
@@ -328,6 +381,25 @@ def stream_qk_attention(
     if attn_module.num_key_value_groups > 1:
         key_states = repeat_kv(key_states, attn_module.num_key_value_groups)
 
+    return query_states, key_states, attention_mask
+
+
+def stream_qk_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    vision_indices: torch.Tensor,
+    text_indices: torch.Tensor,
+    mapper: TokenIndexMapper,
+    content_idx_tensor: torch.Tensor,
+    chunk_q: int,
+    pool: str,
+    pool_topk: int,
+    score_topk: int,
+    save_viz_mats: bool,
+    no_head_avg: bool,
+    output_dir: Path,
+):
     batch, num_heads, seq_len, head_dim = query_states.shape
     assert batch == 1, "Only batch_size=1 is supported."
 
@@ -411,6 +483,173 @@ def stream_qk_attention(
     return frame_scores, per_frame_json
 
 
+def generate_per_token_maps(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    text_indices: torch.Tensor,
+    token_texts: List[str],
+    mapper: TokenIndexMapper,
+    direction: str,
+    grid_cols: int,
+    chunk_rows: int,
+    save_npy: bool,
+    output_dir: Path,
+    viz_scale: str,
+    original_frames: Optional[List[np.ndarray]] = None,
+):
+    if text_indices.numel() == 0:
+        return
+
+    direction = direction.lower()
+    if direction not in {"text2vision", "vision2text"}:
+        raise ValueError(f"Unsupported direction '{direction}'.")
+
+    device = query_states.device
+    token_idx = text_indices.to(device)
+    num_tokens = int(token_idx.numel())
+    if num_tokens == 0:
+        return
+
+    grid_cols = max(1, grid_cols)
+    chunk_rows = max(1, chunk_rows)
+    spatial_h, spatial_w = mapper.spatial_grid
+    patches_per_frame = mapper.patches_per_frame
+    batch, num_heads, _, head_dim = query_states.shape
+    assert batch == 1, "Per-token maps currently assume batch_size=1."
+
+    compute_dtype = query_states.dtype if query_states.dtype in (torch.float16, torch.bfloat16) else torch.float32
+    scale = 1.0 / math.sqrt(head_dim)
+
+    per_token_dir = output_dir / f"per_token_maps_{direction}"
+    per_token_dir.mkdir(parents=True, exist_ok=True)
+
+    def _clean_label(raw: str, fallback: str) -> str:
+        cleaned = raw.replace("\n", " ").replace("▁", "").replace("Ġ", "").strip()
+        return cleaned or fallback
+
+    token_labels = [_clean_label(text if text is not None else "", f"token_{idx}") for idx, text in enumerate(token_texts)]
+    if len(token_labels) < num_tokens:
+        for idx in range(len(token_labels), num_tokens):
+            token_labels.append(f"token_{idx}")
+    tokens_log = ", ".join(token_labels)
+    print(
+        f"Per-token maps: T={num_tokens}, frames={mapper.num_frames}, direction={direction}"
+    )
+    print(f"Tokens: [{tokens_log}]")
+
+    # Precompute constant slices for each direction
+    if direction == "text2vision":
+        q_tokens = query_states.index_select(dim=2, index=token_idx)
+        token_queries = [q_tokens[:, :, i, :].unsqueeze(2) for i in range(num_tokens)]
+        token_keys_t = None
+    else:
+        token_queries = None
+        token_keys = key_states.index_select(dim=2, index=token_idx)
+        token_keys_t = token_keys.transpose(-1, -2).to(compute_dtype)
+
+    for frame in range(mapper.num_frames):
+        frame_rows = mapper.get_frame_indices(frame)
+        frame_rows = frame_rows.to(device)
+        total_rows = int(frame_rows.numel())
+        if total_rows == 0:
+            continue
+        if total_rows != patches_per_frame:
+            raise ValueError(
+                f"Frame {frame} row count {total_rows} does not match mapper patches {patches_per_frame}."
+            )
+
+        frame_token_maps = torch.zeros((num_tokens, total_rows), dtype=torch.float32, device=device)
+
+        for start in range(0, total_rows, chunk_rows):
+            end = min(total_rows, start + chunk_rows)
+            rows_chunk = frame_rows[start:end]
+            if rows_chunk.numel() == 0:
+                continue
+
+            if direction == "text2vision":
+                k_chunk = key_states.index_select(dim=2, index=rows_chunk).to(compute_dtype)
+                k_chunk_t = k_chunk.transpose(-1, -2)
+                for tok_idx, q_slice in enumerate(token_queries):
+                    scores = torch.matmul(q_slice.to(compute_dtype), k_chunk_t)
+                    scores = scores.to(torch.float32) * scale
+                    probs = torch.softmax(scores, dim=-1)
+                    head_mean = probs.mean(dim=1).squeeze(1)[0]
+                    frame_token_maps[tok_idx, start:end] = head_mean
+            else:
+                q_chunk = query_states.index_select(dim=2, index=rows_chunk).to(compute_dtype)
+                scores = torch.matmul(q_chunk, token_keys_t)
+                scores = scores.to(torch.float32) * scale
+                probs = torch.softmax(scores, dim=-1)
+                for tok_idx in range(num_tokens):
+                    head_mean = probs[:, :, :, tok_idx].mean(dim=1)[0]
+                    frame_token_maps[tok_idx, start:end] = head_mean
+
+        token_maps_cpu = [frame_token_maps[i].detach().cpu().view(spatial_h, spatial_w) for i in range(num_tokens)]
+
+        if original_frames is not None and frame < len(original_frames):
+            frame_arr = original_frames[frame]
+            if isinstance(frame_arr, torch.Tensor):
+                frame_np = _tensor_frame_to_numpy(frame_arr)
+            elif isinstance(frame_arr, Image.Image):
+                frame_np = np.array(frame_arr.convert("RGB"))
+            else:
+                frame_np = frame_arr if isinstance(frame_arr, np.ndarray) else None
+                if frame_np is not None and frame_np.dtype != np.uint8:
+                    frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+            if frame_np is not None:
+                Image.fromarray(frame_np).save(output_dir / f"frame_{frame:03d}_orig.png")
+
+        # Save optional numpy dumps
+        if save_npy:
+            for tok_idx, token_map in enumerate(token_maps_cpu):
+                npy_path = per_token_dir / f"frame_{frame:03d}_token_{tok_idx:02d}.npy"
+                np.save(npy_path, token_map.numpy())
+
+        print(f"[Viz] Frame {frame}: scale mode = {viz_scale}")
+
+        n_cols = max(1, grid_cols)
+        n_rows = max(1, math.ceil(num_tokens / n_cols))
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(3 * n_cols, 2.5 * n_rows),
+            squeeze=False,
+        )
+        axes_flat = axes.ravel()
+
+        im = None
+        for idx, token_map in enumerate(token_maps_cpu):
+            ax = axes_flat[idx]
+            data = token_map.numpy()
+            if viz_scale == "fixed":
+                vmin, vmax = 0.0, 1.0
+            else:
+                lo = float(np.quantile(data, 0.02))
+                hi = float(np.quantile(data, 0.98))
+                if hi <= lo:
+                    lo = float(data.min())
+                    hi = float(data.max())
+                    if hi <= lo:
+                        hi = lo + 1e-6
+                vmin, vmax = lo, hi
+            im = ax.imshow(data, cmap="hot", origin="lower", vmin=vmin, vmax=vmax)
+            ax.set_title(token_labels[idx], fontsize=10)
+            ax.axis("off")
+
+        for idx in range(len(token_maps_cpu), len(axes_flat)):
+            axes_flat[idx].axis("off")
+
+        fig.subplots_adjust(left=0.02, right=0.88, top=0.9, bottom=0.05, wspace=0.1, hspace=0.3)
+        if im is not None:
+            cbar_ax = fig.add_axes([0.9, 0.15, 0.02, 0.7])
+            fig.colorbar(im, cax=cbar_ax)
+        fig.suptitle(f"Frame {frame} ({direction})", fontsize=14)
+        fig_path = per_token_dir / f"frame_{frame:03d}_per_token_{direction}.png"
+        fig.savefig(fig_path, dpi=150)
+        plt.close(fig)
+
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -433,6 +672,21 @@ def main():
     parser.add_argument("--max_frames", type=int, default=32)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--filter_video_pad", action="store_true")
+    parser.add_argument("--per_token_maps", action="store_true", help="Produce per-question-token 2D heatmaps per frame")
+    parser.add_argument(
+        "--direction",
+        choices=["text2vision", "vision2text"],
+        default="text2vision",
+        help="Which side attends to which for per-token maps",
+    )
+    parser.add_argument("--grid_cols", type=int, default=4, help="Number of columns in per-frame token heatmap panel")
+    parser.add_argument("--save_npy", action="store_true", help="Save per-token attention maps as .npy")
+    parser.add_argument(
+        "--viz_scale",
+        choices=["fixed", "auto"],
+        default="fixed",
+        help="Color scale mode for heatmaps: 'fixed' = [0,1], 'auto' = rescale per-map",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -451,7 +705,7 @@ def main():
     capture.register(model, layer_idx=0)
 
     print("Preparing inputs ...")
-    inputs, media_meta = prepare_inputs(
+    inputs, media_meta, video_frames_store = prepare_inputs(
         processor=processor,
         video_path=args.video_path,
         question=args.question,
@@ -481,6 +735,7 @@ def main():
         raise RuntimeError("Tokenizer missing <|video_pad|> token.")
     mapper = TokenIndexMapper(inputs.input_ids, video_token_id, inputs.video_grid_thw)
     vision_indices = mapper.vision_idx.cpu()
+    original_frame_images = extract_frame_images(video_frames_store, mapper.num_frames)
 
     text_idx = mapper.get_question_tokens(processor, filter_video_pad=args.filter_video_pad)
     if text_idx.numel() == 0:
@@ -510,9 +765,14 @@ def main():
         f"Text tokens: {len(text_idx)} | content tokens: {content_idx_tensor.numel()} | frames: {mapper.num_frames}"
     )
 
+    attn_module = _resolve_layers_container(model)[0].self_attn
+    with torch.no_grad():
+        query_states, key_states, attention_mask = reconstruct_qk_states(attn_module, capture)
+
     frame_scores, per_frame_json = stream_qk_attention(
-        attn_module=_resolve_layers_container(model)[0].self_attn,
-        capture=capture,
+        query_states=query_states,
+        key_states=key_states,
+        attention_mask=attention_mask,
         vision_indices=vision_indices,
         text_indices=text_idx,
         mapper=mapper,
@@ -525,6 +785,26 @@ def main():
         no_head_avg=args.no_head_avg,
         output_dir=output_dir,
     )
+
+    if args.per_token_maps:
+        if args.no_head_avg:
+            print("Per-token maps currently average across heads even if --no_head_avg is set.")
+        with torch.no_grad():
+            generate_per_token_maps(
+                query_states=query_states,
+                key_states=key_states,
+                text_indices=text_idx,
+                token_texts=text_tokens,
+                mapper=mapper,
+                direction=args.direction,
+                grid_cols=args.grid_cols,
+                chunk_rows=args.chunk_q,
+                save_npy=args.save_npy,
+                output_dir=output_dir,
+                viz_scale=args.viz_scale,
+                original_frames=original_frame_images,
+            )
+
     capture.clear()
 
     frame_scores_tensor = torch.tensor(frame_scores, dtype=torch.float32)
@@ -553,7 +833,12 @@ def main():
         "score_topk": args.score_topk,
         "no_head_avg": bool(args.no_head_avg),
         "save_viz_mats": bool(args.save_viz_mats),
-        "text_token_count": len(text_idx),
+        "per_token_maps": bool(args.per_token_maps),
+        "per_token_direction": args.direction if args.per_token_maps else None,
+        "per_token_grid_cols": args.grid_cols,
+        "per_token_save_npy": bool(args.save_npy),
+        "per_token_viz_scale": args.viz_scale,
+        "text_token_count": int(text_idx.numel()),
         "content_token_count": int(content_idx_tensor.numel()),
         "num_frames": mapper.num_frames,
         "stats": stats,
